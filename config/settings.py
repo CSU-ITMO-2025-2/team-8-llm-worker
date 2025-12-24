@@ -1,6 +1,7 @@
 import enum
 import functools
 import os
+from pathlib import Path
 from typing import Dict, Any, Set
 
 import dotenv
@@ -44,7 +45,7 @@ class _LoadConfig(BaseSettings):
                 if key not in defined_field_names:
                     self.EXTRA_PARAMS[key] = value
 
-    model_config = SettingsConfigDict(env_file=f"{os.path.dirname(os.path.abspath(__file__))}\\.env", extra='ignore')
+    model_config = SettingsConfigDict(env_file=str(Path(__file__).resolve().parent / ".env"), extra='ignore')
 
 
 class Settings:

@@ -128,6 +128,8 @@ async def process_request(req: LlmChatRequest, producer: ProducerBase):
 
 
 async def worker_loop():
+    GemmaChat()
+
     consumer = ConsumerBase(
         Settings.KAFKA_SERVERS(),
         LlmKafkaTopic.CHAT_REQUEST.value,
@@ -139,9 +141,11 @@ async def worker_loop():
     producer = ProducerBase(Settings.KAFKA_SERVERS())
     await producer.start()
 
+    logger.info("Starting listener")
+
     async for msg in consumer:
         req: LlmChatRequest = msg.value
-        asyncio.create_task(process_request(req, producer))
+        await process_request(req, producer)
 
 
 async def main():

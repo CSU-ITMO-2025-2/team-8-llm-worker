@@ -11,10 +11,40 @@ from transformers import (
     Gemma3ForCausalLM,
     TextIteratorStreamer,
     BitsAndBytesConfig,
+StoppingCriteria, StoppingCriteriaList
 )
 
 from config.settings import Settings
 from core.kafka.llm_schemas import LlmMessage, TokenUsage
+
+class DegenerationStop(StoppingCriteria):
+    def __init__(self, tokenizer, max_repeat_ngrams: int = 25, n: int = 4, max_newlines: int = 30):
+        self.tokenizer = tokenizer
+        self.n = n
+        self.max_repeat_ngrams = max_repeat_ngrams
+        self.max_newlines = max_newlines
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        # input_ids: [batch, seq]
+        ids = input_ids[0].tolist()
+        if len(ids) < self.n * 2:
+            return False
+
+        # быстрое правило: много переводов строки подряд (по декоду последних ~200 токенов)
+        tail_text = self.tokenizer.decode(ids[-200:], skip_special_tokens=True)
+        if tail_text.count("\n") >= self.max_newlines:
+            return True
+
+        # повтор n-грамм в хвосте
+        tail = ids[-400:]
+        ngrams = {}
+        for i in range(len(tail) - self.n + 1):
+            ng = tuple(tail[i:i+self.n])
+            ngrams[ng] = ngrams.get(ng, 0) + 1
+            if ngrams[ng] >= self.max_repeat_ngrams:
+                return True
+
+        return False
 
 
 class SingletonMeta(type):
@@ -36,6 +66,10 @@ class GemmaConfig:
     # стример: сколько секунд ждать новый кусок текста, прежде чем проверить ошибки/статус
     streamer_timeout_s: float = 5.0
 
+    stream_flush_interval_s: float = 0.08  # раз в ~80мс
+    stream_min_chars: int = 40  # или когда накопилось >= 40 символов
+    stream_drop_whitespace_only: bool = True
+
 
 class GemmaChat(metaclass=SingletonMeta):
     def __init__(self, cfg: Optional[GemmaConfig] = None):
@@ -49,6 +83,8 @@ class GemmaChat(metaclass=SingletonMeta):
             token=self._hf_token,
             use_fast=self.cfg.use_fast_tokenizer,
         )
+
+        self._stopping = StoppingCriteriaList([DegenerationStop(self._tokenizer)])
 
         # pad_token нужен для generate
         if self._tokenizer.pad_token_id is None and self._tokenizer.eos_token_id is not None:
@@ -122,11 +158,11 @@ class GemmaChat(metaclass=SingletonMeta):
         return int(len(self._tokenizer.encode(text)))
 
     async def stream_generate(
-        self,
-        messages: List[LlmMessage],
-        max_new_tokens: int,
-        temperature: float,
-        top_p: float,
+            self,
+            messages: List[LlmMessage],
+            max_new_tokens: int,
+            temperature: float,
+            top_p: float,
     ) -> AsyncIterator[str]:
         inputs, prompt = self._build_inputs(messages)
 
@@ -146,6 +182,7 @@ class GemmaChat(metaclass=SingletonMeta):
             streamer=streamer,
             pad_token_id=self._tokenizer.pad_token_id,
             eos_token_id=self._tokenizer.eos_token_id,
+            stopping_criteria=self._stopping
         )
 
         exc_holder = {"exc": None}
@@ -160,23 +197,68 @@ class GemmaChat(metaclass=SingletonMeta):
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
 
-        # streamer — синхронный итератор, но с timeout.
-        # если токенов нет — timeout, тогда проверяем, не упала ли генерация.
+        buf: list[str] = []
+        buf_len = 0
+        last_flush = time.monotonic()
+
+        def should_drop(piece: str) -> bool:
+            if not piece:
+                return True
+            if self.cfg.stream_drop_whitespace_only and piece.strip() == "":
+                # это как раз \n, " ", "\t" и т.п.
+                return True
+            return False
+
+        async def flush(force: bool = False) -> Optional[str]:
+            nonlocal buf, buf_len, last_flush
+            if not buf:
+                return None
+            now = time.monotonic()
+            if not force:
+                if (now - last_flush) < self.cfg.stream_flush_interval_s and buf_len < self.cfg.stream_min_chars:
+                    return None
+            out = "".join(buf)
+            buf = []
+            buf_len = 0
+            last_flush = now
+            return out
+
         while True:
             try:
-                piece = next(streamer)
+                piece = next(streamer)  # sync iterator
                 if piece:
-                    yield piece
+                    # NOTE: даже если дропаем whitespace-only для стрима,
+                    # в итоговом тексте он всё равно будет присутствовать в модели,
+                    # но тут мы его именно "не транслируем".
+                    if not should_drop(piece):
+                        buf.append(piece)
+                        buf_len += len(piece)
+
+                    out = await flush(force=False)
+                    if out:
+                        yield out
+
                 await asyncio.sleep(0)
+
             except StopIteration:
                 break
             except Exception:
-                # чаще всего сюда попадает queue.Empty из-за timeout
+                # timeout или queue.Empty чаще всего
                 if exc_holder["exc"] is not None:
                     raise RuntimeError("Generation failed") from exc_holder["exc"]
                 if not thread.is_alive():
                     break
+
+                # на таймауте тоже можно попробовать flush, чтобы “дополировать” UX
+                out = await flush(force=False)
+                if out:
+                    yield out
                 continue
+
+        # финальный flush
+        out = await flush(force=True)
+        if out:
+            yield out
 
         if exc_holder["exc"] is not None:
             raise RuntimeError("Generation failed") from exc_holder["exc"]

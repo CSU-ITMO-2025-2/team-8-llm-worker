@@ -147,14 +147,14 @@ async def main():
     # Создаём тестовый request
     req = LlmChatRequest(
         request_id=uuid4(),
-        chat_session_id=uuid4(),
+        chat_session_id=0,
         user_id=None,
         messages=[
             LlmMessage(role="system", content="Ты полезный ассистент. Отвечай кратко."),
             LlmMessage(role="user", content="Напиши коротенький стих про разработчика и дедлайны (4 строки)"),
         ],
-        max_tokens=128,
-        temperature=0.3,
+        max_tokens=512,
+        temperature=0.1,
         top_p=0.9,
         stream=True,
         metadata={"test": True},

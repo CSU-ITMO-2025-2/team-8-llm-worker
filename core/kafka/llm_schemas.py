@@ -34,8 +34,8 @@ class LlmError(BaseModel):
 class LlmChatRequest(BaseModel):
     request_id: UUID = Field(default_factory=uuid4)
 
-    chat_session_id: UUID
-    user_id: Optional[UUID] = None
+    chat_session_id: int
+    user_id: Optional[int] = None
 
     messages: List[LlmMessage]
 
@@ -54,7 +54,7 @@ FinishReason = Literal["stop", "length", "content_filter", "tool_calls", "error"
 
 class LlmChatResponse(BaseModel):
     request_id: UUID
-    chat_session_id: UUID
+    chat_session_id: int
 
     content: Optional[str] = None
 
@@ -69,7 +69,7 @@ class LlmChatResponse(BaseModel):
 
 class LlmStreamChunk(BaseModel):
     request_id: UUID
-    chat_session_id: UUID
+    chat_session_id: int
 
     index: int
     delta: str

@@ -11,6 +11,8 @@ class _LoadConfig(BaseSettings):
 
     KAFKA_SERVERS: str
 
+    HF_TOKEN: str
+
     # AM_IN_DOCKER_COMPOSE: bool = False
 
     EXTRA_PARAMS: Dict[str, Any] = {}  # Словарь для хранения дополнительных параметров
@@ -42,12 +44,13 @@ class _LoadConfig(BaseSettings):
                 if key not in defined_field_names:
                     self.EXTRA_PARAMS[key] = value
 
-    model_config = SettingsConfigDict(env_file=f"{os.path.dirname(os.path.abspath(__file__))}\\.env.test", extra='ignore')
+    model_config = SettingsConfigDict(env_file=f"{os.path.dirname(os.path.abspath(__file__))}\\.env", extra='ignore')
 
 
 class Settings:
     __KAFKA_SERVERS: str
 
+    __HF_TOKEN: str
 
     __loaded: bool = False
 
@@ -55,6 +58,7 @@ class Settings:
     def __load__(cls):
         settings = _LoadConfig()
         cls.__KAFKA_SERVERS = settings.KAFKA_SERVERS
+        cls.__HF_TOKEN = settings.HF_TOKEN
 
         cls.__EXTRA_PARAMS = settings.EXTRA_PARAMS
 
@@ -75,6 +79,11 @@ class Settings:
     @__check_loaded
     def KAFKA_SERVERS(cls) -> str:
         return cls.__KAFKA_SERVERS
+
+    @classmethod
+    @__check_loaded
+    def HF_TOKEN(cls) -> str:
+        return cls.__HF_TOKEN
 
 
     @classmethod

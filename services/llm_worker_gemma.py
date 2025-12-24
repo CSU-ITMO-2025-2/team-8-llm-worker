@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 from config.settings import Settings
@@ -10,42 +11,52 @@ from core.kafka.llm_schemas import (
     LlmChatResponse,
     LlmStreamChunk,
     TokenUsage,
+    LlmError,
 )
-from core.llm.gemma_model import get_chat, convert_messages
+from core.llm.gemma_model import GemmaChat  # <-- Transformers GemmaChat (singleton)
 
 logger = setup_logger("GemmaWorker")
 
 
-async def process_request(req: LlmChatRequest, producer: ProducerBase):
-    logger.info(f"Processing Gemma request {req.request_id}")
+async def _send_final_chunk(producer: ProducerBase, req: LlmChatRequest, index: int):
+    final_chunk = LlmStreamChunk(
+        request_id=req.request_id,
+        chat_session_id=req.chat_session_id,
+        index=index,
+        delta="",
+        is_final=True,
+    )
+    await producer.send_task_message(
+        topic=LlmKafkaTopic.CHAT_TOKEN.value,
+        key=str(req.request_id),
+        message=final_chunk,
+    )
 
-    chat = get_chat()
-    history = convert_messages(req.messages)
+
+async def process_request(req: LlmChatRequest, producer: ProducerBase):
+    logger.info("Processing Gemma request %s", req.request_id)
 
     start = time.perf_counter()
-    final_text = ""
-    prompt_tokens = 0
-    completion_tokens = 0
-
     index = 0
+    parts: list[str] = []
 
-    async for chunk in chat.stream(
-        history,
-        max_output_tokens=req.max_tokens,
-        temperature=req.temperature,
-        top_p=req.top_p,
-    ):
-        # chunk.text — новый фрагмент текста
-        if chunk.text:
-            delta = chunk.text
-            final_text += delta
+    try:
+        chat = GemmaChat()  # singleton: модель уже прогрета после первого запроса
+
+        async for delta in chat.stream_generate(
+            messages=req.messages,
+            max_new_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+        ):
+            parts.append(delta)
 
             stream_msg = LlmStreamChunk(
                 request_id=req.request_id,
                 chat_session_id=req.chat_session_id,
                 index=index,
                 delta=delta,
-                is_final=False
+                is_final=False,
             )
             index += 1
 
@@ -55,49 +66,65 @@ async def process_request(req: LlmChatRequest, producer: ProducerBase):
                 message=stream_msg,
             )
 
-        # chunk.usage — метаданные
-        if chunk.usage:
-            prompt_tokens = chunk.usage.input_tokens
-            completion_tokens = chunk.usage.output_tokens
+        await _send_final_chunk(producer, req, index)
 
-    latency_ms = int((time.perf_counter() - start) * 1000)
+        final_text = "".join(parts)
+        latency_ms = int((time.perf_counter() - start) * 1000)
 
-    # финальный чанк
-    final_chunk = LlmStreamChunk(
-        request_id=req.request_id,
-        chat_session_id=req.chat_session_id,
-        index=index,
-        delta="",
-        is_final=True
-    )
-    await producer.send_task_message(
-        topic=LlmKafkaTopic.CHAT_TOKEN.value,
-        key=str(req.request_id),
-        message=final_chunk,
-    )
+        # usage считаем приближённо (как в GemmaChat.generate_full)
+        prompt = chat._build_inputs(req.messages)[1]  # prompt string
+        usage = chat.estimate_usage(req.messages, final_text)
 
-    # финальный ответ
-    resp = LlmChatResponse(
-        request_id=req.request_id,
-        chat_session_id=req.chat_session_id,
-        content=final_text,
-        usage=TokenUsage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-        ),
-        latency_ms=latency_ms,
-        finish_reason="stop",
-    )
+        resp = LlmChatResponse(
+            request_id=req.request_id,
+            chat_session_id=req.chat_session_id,
+            content=final_text,
+            usage=usage,
+            latency_ms=latency_ms,
+            finish_reason="stop",
+        )
 
-    await producer.send_task_message(
-        topic=LlmKafkaTopic.CHAT_RESPONSE.value,
-        key=str(req.request_id),
-        message=resp,
-    )
+        await producer.send_task_message(
+            topic=LlmKafkaTopic.CHAT_RESPONSE.value,
+            key=str(req.request_id),
+            message=resp,
+        )
 
-    logger.info(
-        f"Done {req.request_id}: {len(final_text)} chars, total tokens = {prompt_tokens + completion_tokens}"
-    )
+        logger.info(
+            "Done %s: %d chars, tokens=%d, latency=%dms",
+            req.request_id,
+            len(final_text),
+            usage.prompt_tokens + usage.completion_tokens,
+            latency_ms,
+        )
+
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+
+        # даже при ошибке — закрываем стрим, чтобы SSE не висел
+        try:
+            await _send_final_chunk(producer, req, index)
+        except Exception:
+            pass
+
+        err = LlmError(code="gemma_error", message=str(e))
+        resp = LlmChatResponse(
+            request_id=req.request_id,
+            chat_session_id=req.chat_session_id,
+            content="",
+            usage=TokenUsage(prompt_tokens=0, completion_tokens=0),
+            latency_ms=latency_ms,
+            finish_reason="error",
+            error=err,
+        )
+
+        await producer.send_task_message(
+            topic=LlmKafkaTopic.CHAT_RESPONSE.value,
+            key=str(req.request_id),
+            message=resp,
+        )
+
+        logger.exception("Gemma request %s failed: %s", req.request_id, e)
 
 
 async def worker_loop():
@@ -106,7 +133,7 @@ async def worker_loop():
         LlmKafkaTopic.CHAT_REQUEST.value,
         "llm_worker",
         logger,
-        LlmChatRequest.model_validate_json
+        LlmChatRequest.model_validate_json,
     )
 
     producer = ProducerBase(Settings.KAFKA_SERVERS())
@@ -118,10 +145,9 @@ async def worker_loop():
 
 
 async def main():
-    logger.info("Starting Gemma worker...")
+    logger.info("Starting Gemma Transformers worker...")
     await worker_loop()
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())

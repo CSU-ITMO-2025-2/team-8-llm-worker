@@ -207,3 +207,11 @@ class GemmaChat(metaclass=SingletonMeta):
         )
         return text, usage, latency_ms
 
+    def estimate_usage(self, messages: List[LlmMessage], completion_text: str) -> TokenUsage:
+        _, prompt = self._build_inputs(messages)
+        return TokenUsage(
+            prompt_tokens=self._count_tokens(prompt),
+            completion_tokens=self._count_tokens(completion_text),
+        )
+
+

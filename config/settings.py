@@ -7,6 +7,7 @@ from typing import Dict, Any, Set
 import dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+print(str(Path(__file__).resolve().parent / ".env"))
 
 class _LoadConfig(BaseSettings):
 

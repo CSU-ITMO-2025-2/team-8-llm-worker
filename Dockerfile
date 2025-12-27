@@ -16,8 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt /app/requirements.txt
 
-RUN python -m pip install --upgrade pip && \
-    pip install -r /app/requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install --prefer-binary -r /app/requirements.txt
 
 COPY . /app
 

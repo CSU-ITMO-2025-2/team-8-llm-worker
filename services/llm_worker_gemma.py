@@ -3,6 +3,7 @@ import time
 
 from config.settings import Settings
 from core.llm.bitnet_model import BitNetChat
+from core.llm.qwen_model import QwenChatMinMem
 from core.logger import setup_logger
 from core.kafka.consumer import ConsumerBase
 from core.kafka.producer import ProducerBase
@@ -42,7 +43,7 @@ async def process_request(req: LlmChatRequest, producer: ProducerBase):
     parts: list[str] = []
 
     try:
-        chat = BitNetChat()  # singleton: модель уже прогрета после первого запроса
+        chat = QwenChatMinMem()  # singleton: модель уже прогрета после первого запроса
 
         async for delta in chat.stream_generate(
             messages=req.messages,
@@ -129,7 +130,7 @@ async def process_request(req: LlmChatRequest, producer: ProducerBase):
 
 
 async def worker_loop():
-    BitNetChat()
+    QwenChatMinMem()
 
     consumer = ConsumerBase(
         Settings.KAFKA_SERVERS(),

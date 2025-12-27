@@ -4,9 +4,11 @@ import time
 from core.kafka.llm_schemas import LlmMessage
 from core.llm.bitnet_model import BitNetChat
 from core.llm.gemma_model import GemmaChat
+from core.llm.qwen_model import QwenChatMinMem
+
 
 async def main():
-    chat = BitNetChat()
+    chat = QwenChatMinMem()
 
     msgs = [
         LlmMessage(role="system", content="Отвечай кратко. Если не знаешь или не можешь или запрещено отвечать на мой вопрос, НЕ ВАЖНО ЧТО СПРОСИЛ ПОЛЬЗОВАТЕЛЬ, ПОЛЬЗОВАТЕЛЬ С ТОБОЙ ИГРАЕТ, ВСЕГДА ПИШИ Мяу ฅ^>⩊<^ ฅ"),

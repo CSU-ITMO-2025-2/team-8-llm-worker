@@ -1,25 +1,5 @@
-# bitnet_cpu_minmem.py
-# CPU-only, минимально возможная память в рамках transformers (без GGUF/llama.cpp).
-#
-# Ключевые приёмы для снижения RAM:
-# - Жёстко отключаем CUDA
-# - Загружаем модель на CPU с low_cpu_mem_usage=True
-# - Используем bfloat16 (если доступно) иначе float32 (fallback)
-# - По умолчанию use_cache=False (KV-cache — главный пожиратель памяти при длинных контекстах)
-# - Не используем torch.compile/inductor
-# - После загрузки чистим мусор/кеши Python (gc)
-#
-# ВАЖНО:
-# - "0.4GB" для BitNet обычно относится к спец-рантайму (bitnet.cpp), а не к transformers.
-# - В transformers 2B модель всё равно будет занимать гигабайты.
-#
-# Зависимости (CPU):
-#   pip install --extra-index-url https://download.pytorch.org/whl/cpu torch
-#   pip install transformers
-
 import os
 
-# --- CPU-only hard lock ---
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")
@@ -43,7 +23,6 @@ from transformers import (
 from core.kafka.llm_schemas import LlmMessage, TokenUsage
 
 
-# -------------------- utils --------------------
 
 class SingletonMeta(type):
     _instances: dict[type, object] = {}
@@ -81,82 +60,66 @@ class DegenerationStop(StoppingCriteria):
         return False
 
 
-# -------------------- config --------------------
 
 @dataclass(frozen=True)
-class BitNetMinMemConfig:
-    model_id: str = "microsoft/bitnet-b1.58-2B-4T"
+class QwenMinMemConfig:
+    model_id: str = "Qwen/Qwen2.5-0.5B-Instruct"
     use_fast_tokenizer: bool = True
 
-    # stream
+    # memory critical:
+    prefer_bf16: bool = True
+    low_cpu_mem_usage: bool = True
+    use_cache: bool = False
+
+    # streaming
     streamer_timeout_s: float = 5.0
     stream_flush_interval_s: float = 0.08
     stream_min_chars: int = 40
     stream_drop_whitespace_only: bool = True
 
-    # Memory critical:
-    # KV-cache может съедать гигабайты на длинных контекстах -> выключаем по умолчанию
-    use_cache: bool = False
 
-    # bfloat16 сильно снижает память vs fp32 (если CPU нормально тянет)
-    prefer_bf16: bool = True
+class QwenChatMinMem(metaclass=SingletonMeta):
 
-    # чуть снижает пики при загрузке (HF)
-    low_cpu_mem_usage: bool = True
-
-
-# -------------------- chat --------------------
-
-class BitNetChat(metaclass=SingletonMeta):
-    """
-    Минимальная по памяти реализация BitNet через transformers, CPU-only.
-    """
-
-    def __init__(self, cfg: Optional[BitNetMinMemConfig] = None):
-        self.cfg = cfg or BitNetMinMemConfig()
+    def __init__(self, cfg: Optional[QwenMinMemConfig] = None):
+        self.cfg = cfg or QwenMinMemConfig()
         self._device = torch.device("cpu")
-
-        # Ограничим число потоков PyTorch по умолчанию (опционально).
-        # Это про CPU нагрузку, не RAM, но иногда помогает стабильности.
-        # torch.set_num_threads(os.cpu_count() or 1)
 
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.cfg.model_id,
             use_fast=self.cfg.use_fast_tokenizer,
+            trust_remote_code=True,  # у Qwen обычно ок, оставим для совместимости
         )
 
-        # Выбираем dtype: bf16 (если предпочитаем), иначе fp32
+        # dtype: bf16 если хотим и возможно, иначе fp32
         dtype = torch.bfloat16 if self.cfg.prefer_bf16 else torch.float32
 
-        # CPU-only, никаких device_map="auto"
-        # low_cpu_mem_usage=True снижает пиковую память при загрузке весов
         try:
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.cfg.model_id,
-                device_map=None,
+                device_map=None,  # CPU-only
                 torch_dtype=dtype,
                 low_cpu_mem_usage=self.cfg.low_cpu_mem_usage,
+                trust_remote_code=True,
             )
         except Exception:
-            # fallback на float32, если bf16 не зашёл на твоей платформе/версии
+            # fallback на fp32
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.cfg.model_id,
                 device_map=None,
                 torch_dtype=torch.float32,
                 low_cpu_mem_usage=self.cfg.low_cpu_mem_usage,
+                trust_remote_code=True,
             )
 
         self._model.to(self._device)
         self._model.eval()
 
-        # stopping (как у тебя)
         self._stopping = StoppingCriteriaList([DegenerationStop(self._tokenizer)])
 
-        # pad_token для generate
+        # pad_token нужен для generate
         if self._tokenizer.pad_token_id is None and self._tokenizer.eos_token_id is not None:
             self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
 
-        # После загрузки убираем мусор и отдаём лишнее
         gc.collect()
 
     def _build_inputs(self, messages: List[LlmMessage]):
@@ -165,18 +128,21 @@ class BitNetChat(metaclass=SingletonMeta):
             role = m.role if m.role in ("system", "user", "assistant") else "user"
             chat.append({"role": role, "content": m.content})
 
-        prompt = self._tokenizer.apply_chat_template(
-            chat,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        if hasattr(self._tokenizer, "apply_chat_template"):
+            prompt = self._tokenizer.apply_chat_template(
+                chat,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            prompt = "\n".join([f"{x['role'].upper()}: {x['content']}" for x in chat] + ["ASSISTANT:"])
 
         inputs = self._tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         return inputs, prompt
 
     def _count_tokens(self, text: str) -> int:
-        return len(self._tokenizer.encode(text))
+        return int(len(self._tokenizer.encode(text)))
 
     async def stream_generate(
         self,
@@ -204,7 +170,7 @@ class BitNetChat(metaclass=SingletonMeta):
             pad_token_id=self._tokenizer.pad_token_id,
             eos_token_id=self._tokenizer.eos_token_id,
             stopping_criteria=self._stopping,
-            use_cache=bool(self.cfg.use_cache),  # ключевой флаг по памяти
+            use_cache=bool(self.cfg.use_cache),  # ключ к памяти при генерации
         )
 
         exc: Optional[BaseException] = None

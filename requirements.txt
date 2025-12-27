@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 aiokafka==0.12.0
 colorama==0.4.6
 pydantic==2.12.5
@@ -6,5 +8,4 @@ python-dotenv==1.2.1
 torch==2.9.1
 transformers== 4.57.3
 hf_xet==1.2.0
-llama-cpp-python==0.2.26
 accelerate==1.12.0

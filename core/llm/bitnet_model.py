@@ -1,8 +1,16 @@
+import os
+
+# Жёстко запрещаем CUDA (если вдруг есть в окружении)
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+# Отключаем torch.compile / dynamo / inductor (чтобы не требовался компилятор)
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")
+
 import asyncio
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import AsyncIterator, List, Optional
 
 import torch
@@ -16,9 +24,7 @@ from transformers import (
 
 from core.kafka.llm_schemas import LlmMessage, TokenUsage
 
-import os
-os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
-os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")
+
 # -------------------- utils --------------------
 
 class SingletonMeta(type):
@@ -65,6 +71,9 @@ class BitNetConfig:
     use_fast_tokenizer: bool = True
     streamer_timeout_s: float = 5.0
 
+    # CPU-only: для максимальной совместимости используем float32
+    torch_dtype: torch.dtype = torch.float32
+
     stream_flush_interval_s: float = 0.08
     stream_min_chars: int = 40
     stream_drop_whitespace_only: bool = True
@@ -74,27 +83,34 @@ class BitNetConfig:
 
 class BitNetChat(metaclass=SingletonMeta):
     def __init__(self, cfg: Optional[BitNetConfig] = None):
+        print("Torch device:", torch.device("cpu"))
         self.cfg = cfg or BitNetConfig()
+
+        # Явно фиксируем CPU
+        self._device = torch.device("cpu")
 
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.cfg.model_id,
             use_fast=self.cfg.use_fast_tokenizer,
         )
 
+        # CPU-only: НЕ используем device_map="auto"
         self._model = AutoModelForCausalLM.from_pretrained(
             self.cfg.model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map=None,
+            torch_dtype=self.cfg.torch_dtype,
         )
-
+        self._model.to(self._device)
         self._model.eval()
 
-        self._stopping = StoppingCriteriaList(
-            [DegenerationStop(self._tokenizer)]
-        )
+        self._stopping = StoppingCriteriaList([DegenerationStop(self._tokenizer)])
 
-        if self._tokenizer.pad_token_id is None:
+        # pad_token нужен для generate
+        if self._tokenizer.pad_token_id is None and self._tokenizer.eos_token_id is not None:
             self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
+
+        # На всякий: ограничим поведение потоков (можно убрать/настроить под сервер)
+        # torch.set_num_threads(os.cpu_count() or 1)
 
     # -------- prompt --------
 
@@ -110,7 +126,8 @@ class BitNetChat(metaclass=SingletonMeta):
             add_generation_prompt=True,
         )
 
-        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
+        inputs = self._tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
         return inputs, prompt
 
     def _count_tokens(self, text: str) -> int:
@@ -137,9 +154,9 @@ class BitNetChat(metaclass=SingletonMeta):
 
         gen_kwargs = dict(
             **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
+            max_new_tokens=int(max_new_tokens),
+            temperature=float(temperature),
+            top_p=float(top_p),
             do_sample=True,
             streamer=streamer,
             stopping_criteria=self._stopping,
@@ -160,19 +177,20 @@ class BitNetChat(metaclass=SingletonMeta):
         t = threading.Thread(target=_run, daemon=True)
         t.start()
 
-        buf, buf_len = [], 0
+        buf: list[str] = []
+        buf_len = 0
         last_flush = time.monotonic()
 
-        def flush(force=False):
+        def flush(force: bool = False) -> Optional[str]:
             nonlocal buf, buf_len, last_flush
             if not buf:
                 return None
             if not force:
-                if (time.monotonic() - last_flush) < self.cfg.stream_flush_interval_s \
-                   and buf_len < self.cfg.stream_min_chars:
+                if (time.monotonic() - last_flush) < self.cfg.stream_flush_interval_s and buf_len < self.cfg.stream_min_chars:
                     return None
             out = "".join(buf)
-            buf, buf_len = [], 0
+            buf = []
+            buf_len = 0
             last_flush = time.monotonic()
             return out
 
@@ -183,7 +201,7 @@ class BitNetChat(metaclass=SingletonMeta):
                     buf.append(piece)
                     buf_len += len(piece)
 
-                out = flush()
+                out = flush(force=False)
                 if out:
                     yield out
 
@@ -207,9 +225,9 @@ class BitNetChat(metaclass=SingletonMeta):
         max_new_tokens: int,
         temperature: float,
         top_p: float,
-    ):
+    ) -> tuple[str, TokenUsage, int]:
         start = time.perf_counter()
-        parts = []
+        parts: list[str] = []
 
         async for chunk in self.stream_generate(messages, max_new_tokens, temperature, top_p):
             parts.append(chunk)
@@ -224,3 +242,10 @@ class BitNetChat(metaclass=SingletonMeta):
         )
 
         return text, usage, latency_ms
+
+    def estimate_usage(self, messages: List[LlmMessage], completion_text: str) -> TokenUsage:
+        _, prompt = self._build_inputs(messages)
+        return TokenUsage(
+            prompt_tokens=self._count_tokens(prompt),
+            completion_tokens=self._count_tokens(completion_text),
+        )

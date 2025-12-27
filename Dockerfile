@@ -9,10 +9,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    git ca-certificates \
+    build-essential \
+    cmake ninja-build pkg-config \
+    python3-dev \
+    libopenblas-dev \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
 

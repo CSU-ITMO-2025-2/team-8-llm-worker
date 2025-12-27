@@ -12,6 +12,9 @@ print(str(Path(__file__).resolve().parent / ".env"))
 class _LoadConfig(BaseSettings):
 
     KAFKA_SERVERS: str
+    KAFKA_TOPIC: str = "llm.chat.request"
+    KAFKA_CONSUMER_GROUP: str = "llm_worker"
+    HEALTH_PORT: int = 8080
 
     HF_TOKEN: str
 
@@ -51,6 +54,9 @@ class _LoadConfig(BaseSettings):
 
 class Settings:
     __KAFKA_SERVERS: str
+    __KAFKA_TOPIC: str
+    __KAFKA_CONSUMER_GROUP: str
+    __HEALTH_PORT: int
 
     __HF_TOKEN: str
 
@@ -60,6 +66,9 @@ class Settings:
     def __load__(cls):
         settings = _LoadConfig()
         cls.__KAFKA_SERVERS = settings.KAFKA_SERVERS
+        cls.__KAFKA_TOPIC = settings.KAFKA_TOPIC
+        cls.__KAFKA_CONSUMER_GROUP = settings.KAFKA_CONSUMER_GROUP
+        cls.__HEALTH_PORT = settings.HEALTH_PORT
         cls.__HF_TOKEN = settings.HF_TOKEN
 
         cls.__EXTRA_PARAMS = settings.EXTRA_PARAMS
@@ -81,6 +90,21 @@ class Settings:
     @__check_loaded
     def KAFKA_SERVERS(cls) -> str:
         return cls.__KAFKA_SERVERS
+
+    @classmethod
+    @__check_loaded
+    def KAFKA_TOPIC(cls) -> str:
+        return cls.__KAFKA_TOPIC
+
+    @classmethod
+    @__check_loaded
+    def KAFKA_CONSUMER_GROUP(cls) -> str:
+        return cls.__KAFKA_CONSUMER_GROUP
+
+    @classmethod
+    @__check_loaded
+    def HEALTH_PORT(cls) -> int:
+        return cls.__HEALTH_PORT
 
     @classmethod
     @__check_loaded

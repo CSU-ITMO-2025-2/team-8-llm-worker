@@ -1,5 +1,6 @@
 import os
 
+# CPU-only hard lock
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")
@@ -8,8 +9,9 @@ import asyncio
 import gc
 import threading
 import time
+import queue
 from dataclasses import dataclass
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, List, Optional, Tuple
 
 import torch
 from transformers import (
@@ -23,7 +25,6 @@ from transformers import (
 from core.kafka.llm_schemas import LlmMessage, TokenUsage
 
 
-
 class SingletonMeta(type):
     _instances: dict[type, object] = {}
 
@@ -34,7 +35,7 @@ class SingletonMeta(type):
 
 
 class DegenerationStop(StoppingCriteria):
-    def __init__(self, tokenizer, max_repeat_ngrams=25, n=4, max_newlines=30):
+    def __init__(self, tokenizer, max_repeat_ngrams: int = 25, n: int = 4, max_newlines: int = 30):
         self.tokenizer = tokenizer
         self.n = n
         self.max_repeat_ngrams = max_repeat_ngrams
@@ -60,7 +61,6 @@ class DegenerationStop(StoppingCriteria):
         return False
 
 
-
 @dataclass(frozen=True)
 class QwenMinMemConfig:
     model_id: str = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -71,15 +71,14 @@ class QwenMinMemConfig:
     low_cpu_mem_usage: bool = True
     use_cache: bool = False
 
-    # streaming
-    streamer_timeout_s: float = 5.0
+    streamer_timeout_s: float = 30.0
+
     stream_flush_interval_s: float = 0.08
     stream_min_chars: int = 40
     stream_drop_whitespace_only: bool = True
 
 
 class QwenChatMinMem(metaclass=SingletonMeta):
-
     def __init__(self, cfg: Optional[QwenMinMemConfig] = None):
         self.cfg = cfg or QwenMinMemConfig()
         self._device = torch.device("cpu")
@@ -87,22 +86,20 @@ class QwenChatMinMem(metaclass=SingletonMeta):
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.cfg.model_id,
             use_fast=self.cfg.use_fast_tokenizer,
-            trust_remote_code=True,  # у Qwen обычно ок, оставим для совместимости
+            trust_remote_code=True,
         )
 
-        # dtype: bf16 если хотим и возможно, иначе fp32
         dtype = torch.bfloat16 if self.cfg.prefer_bf16 else torch.float32
 
         try:
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.cfg.model_id,
-                device_map=None,  # CPU-only
+                device_map=None,
                 torch_dtype=dtype,
                 low_cpu_mem_usage=self.cfg.low_cpu_mem_usage,
                 trust_remote_code=True,
             )
         except Exception:
-            # fallback на fp32
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.cfg.model_id,
                 device_map=None,
@@ -116,13 +113,12 @@ class QwenChatMinMem(metaclass=SingletonMeta):
 
         self._stopping = StoppingCriteriaList([DegenerationStop(self._tokenizer)])
 
-        # pad_token нужен для generate
         if self._tokenizer.pad_token_id is None and self._tokenizer.eos_token_id is not None:
             self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
 
         gc.collect()
 
-    def _build_inputs(self, messages: List[LlmMessage]):
+    def _build_inputs(self, messages: List[LlmMessage]) -> Tuple[dict, str]:
         chat = []
         for m in messages:
             role = m.role if m.role in ("system", "user", "assistant") else "user"
@@ -151,13 +147,13 @@ class QwenChatMinMem(metaclass=SingletonMeta):
         temperature: float,
         top_p: float,
     ) -> AsyncIterator[str]:
-        inputs, _ = self._build_inputs(messages)
+        inputs, _prompt = self._build_inputs(messages)
 
         streamer = TextIteratorStreamer(
             self._tokenizer,
             skip_prompt=True,
             skip_special_tokens=True,
-            timeout=self.cfg.streamer_timeout_s,
+            timeout=self.cfg.streamer_timeout_s,  # важно: может быть большой
         )
 
         gen_kwargs = dict(
@@ -170,18 +166,17 @@ class QwenChatMinMem(metaclass=SingletonMeta):
             pad_token_id=self._tokenizer.pad_token_id,
             eos_token_id=self._tokenizer.eos_token_id,
             stopping_criteria=self._stopping,
-            use_cache=bool(self.cfg.use_cache),  # ключ к памяти при генерации
+            use_cache=bool(self.cfg.use_cache),
         )
 
-        exc: Optional[BaseException] = None
+        exc_holder: dict[str, Optional[BaseException]] = {"exc": None}
 
         def _run():
-            nonlocal exc
             try:
                 with torch.no_grad():
                     self._model.generate(**gen_kwargs)
             except BaseException as e:
-                exc = e
+                exc_holder["exc"] = e
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
@@ -213,7 +208,9 @@ class QwenChatMinMem(metaclass=SingletonMeta):
 
         while True:
             try:
+                # TextIteratorStreamer кидает queue.Empty при timeout
                 piece = next(streamer)
+
                 if piece and not should_drop(piece):
                     buf.append(piece)
                     buf_len += len(piece)
@@ -227,12 +224,32 @@ class QwenChatMinMem(metaclass=SingletonMeta):
             except StopIteration:
                 break
 
+            except queue.Empty:
+                # Ничего не пришло за timeout — это НЕ ошибка.
+                # Если поток генерации упал — пробросим.
+                if exc_holder["exc"] is not None:
+                    raise RuntimeError("Generation failed") from exc_holder["exc"]
+
+                # Если генерация ещё идёт — попробуем отдать накопленное
+                out = flush(force=False)
+                if out:
+                    yield out
+
+                # Если поток уже закончился, а очередь пуста — выходим
+                if not t.is_alive():
+                    break
+
+                await asyncio.sleep(0)
+                continue
+
         out = flush(force=True)
         if out:
             yield out
 
-        if exc:
-            raise RuntimeError("Generation failed") from exc
+        if exc_holder["exc"] is not None:
+            raise RuntimeError("Generation failed") from exc_holder["exc"]
+
+        await asyncio.to_thread(t.join, 1.0)
 
     async def generate_full(
         self,
@@ -242,15 +259,15 @@ class QwenChatMinMem(metaclass=SingletonMeta):
         top_p: float,
     ) -> tuple[str, TokenUsage, int]:
         start = time.perf_counter()
-
         parts: list[str] = []
+
         async for chunk in self.stream_generate(messages, max_new_tokens, temperature, top_p):
             parts.append(chunk)
 
         latency_ms = int((time.perf_counter() - start) * 1000)
         text = "".join(parts)
 
-        _, prompt = self._build_inputs(messages)
+        _inputs, prompt = self._build_inputs(messages)
         usage = TokenUsage(
             prompt_tokens=self._count_tokens(prompt),
             completion_tokens=self._count_tokens(text),
@@ -258,7 +275,7 @@ class QwenChatMinMem(metaclass=SingletonMeta):
         return text, usage, latency_ms
 
     def estimate_usage(self, messages: List[LlmMessage], completion_text: str) -> TokenUsage:
-        _, prompt = self._build_inputs(messages)
+        _inputs, prompt = self._build_inputs(messages)
         return TokenUsage(
             prompt_tokens=self._count_tokens(prompt),
             completion_tokens=self._count_tokens(completion_text),

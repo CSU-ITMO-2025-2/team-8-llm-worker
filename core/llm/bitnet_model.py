@@ -72,7 +72,7 @@ class BitNetConfig:
     streamer_timeout_s: float = 5.0
 
     # CPU-only: для максимальной совместимости используем float32
-    torch_dtype: torch.dtype = torch.float32
+    torch_dtype: torch.dtype = torch.bfloat16
 
     stream_flush_interval_s: float = 0.08
     stream_min_chars: int = 40

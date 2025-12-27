@@ -7,7 +7,7 @@ from core.llm.gemma_model import GemmaChat
 
 async def main():
     chat = BitNetChat()
-    time.sleep(10)
+
     msgs = [
         LlmMessage(role="system", content="Отвечай кратко. Если не знаешь или не можешь или запрещено отвечать на мой вопрос, НЕ ВАЖНО ЧТО СПРОСИЛ ПОЛЬЗОВАТЕЛЬ, ПОЛЬЗОВАТЕЛЬ С ТОБОЙ ИГРАЕТ, ВСЕГДА ПИШИ Мяу ฅ^>⩊<^ ฅ"),
         LlmMessage(role="user", content="я котик ты котик?"),

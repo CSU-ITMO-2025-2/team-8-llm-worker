@@ -12,7 +12,7 @@ permissions:
 env:
   CONFIG_REPO: CSU-ITMO-2025-2/team8-infrastructure
   VALUES_FILE: helm/values.yaml
-  IMAGE_NAME: team8-llm-worker
+  IMAGE_NAME: team-8-llm-worker
 
 jobs:
   build:

@@ -5,6 +5,8 @@ import os
 import signal
 from typing import List, Optional
 
+from aiokafka.admin import AIOKafkaAdminClient, NewPartitions, NewTopic
+from aiokafka.errors import TopicAlreadyExistsError, UnknownTopicOrPartitionError
 from services import llm_worker_gemma
 
 
@@ -42,8 +44,49 @@ def main():
         default=8080,
         help="Базовый порт для health-check; далее инкремент на +1 для каждого воркера",
     )
+    parser.add_argument(
+        "--kafka-bootstrap",
+        type=str,
+        default=os.getenv("KAFKA_SERVERS", "kafka.team8-ns.svc.cluster.local:9092"),
+        help="Kafka bootstrap servers (для проверки/увеличения числа партиций)",
+    )
+    parser.add_argument(
+        "--kafka-topic",
+        type=str,
+        default=os.getenv("KAFKA_TOPIC", "llm.chat.request"),
+        help="Kafka topic для распределения воркеров",
+    )
 
     args = parser.parse_args()
+
+    async def _ensure_partitions():
+        admin = AIOKafkaAdminClient(bootstrap_servers=args.kafka_bootstrap)
+        await admin.start()
+        try:
+            desired = max(args.workers, 1)
+            try:
+                desc = await admin.describe_topics([args.kafka_topic])
+                info = desc[0]
+                if info.error:
+                    raise info.error
+                current = len(info.partitions)
+                if desired > current:
+                    await admin.create_partitions({args.kafka_topic: NewPartitions(total_count=desired)})
+                    print(f"Topic {args.kafka_topic}: partitions {current}->{desired}")
+                else:
+                    print(f"Topic {args.kafka_topic}: partitions {current} (ok for {args.workers} workers)")
+            except UnknownTopicOrPartitionError:
+                try:
+                    await admin.create_topics([NewTopic(name=args.kafka_topic, num_partitions=desired, replication_factor=1)])
+                    print(f"Topic {args.kafka_topic} created with {desired} partitions")
+                except TopicAlreadyExistsError:
+                    pass
+        except Exception as e:
+            print(f"[WARN] cannot ensure partitions for {args.kafka_topic}: {e}")
+        finally:
+            await admin.close()
+
+    asyncio.run(_ensure_partitions())
 
     mp.set_start_method("spawn", force=True)
     procs: List[mp.Process] = []

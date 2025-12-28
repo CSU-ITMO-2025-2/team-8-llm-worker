@@ -54,6 +54,11 @@ async def ready(response: Response):
     return {"status": "ready", "bootstrap": raw}
 
 
+@app.get("/shutdown")
+async def shutdown():
+    return {"status": "shutting-down"}
+
+
 if __name__ == "__main__":
     import uvicorn
 

@@ -67,9 +67,11 @@ def main():
             try:
                 desc = await admin.describe_topics([args.kafka_topic])
                 info = desc[0]
-                if info.error:
-                    raise info.error
-                current = len(info.partitions)
+                err = info.get("error") if isinstance(info, dict) else getattr(info, "error", None)
+                if err:
+                    raise err
+                partitions = info.get("partitions") if isinstance(info, dict) else getattr(info, "partitions", None)
+                current = len(partitions or [])
                 if desired > current:
                     await admin.create_partitions({args.kafka_topic: NewPartitions(total_count=desired)})
                     print(f"Topic {args.kafka_topic}: partitions {current}->{desired}")

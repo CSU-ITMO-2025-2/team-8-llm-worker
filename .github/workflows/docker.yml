@@ -1,37 +1,38 @@
-name: build-llm-woker
+name: build-llm-worker
 
 on:
   push:
     branches: [ "main" ]
 
-
 permissions:
   contents: read
   packages: write
 
-env:
-  CONFIG_REPO: CSU-ITMO-2025-2/team8-infrastructure
-  VALUES_FILE: helm/values.yaml
-  IMAGE_NAME: team-8-llm-worker
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: llm-worker
+            context: .
+            file: Dockerfile
+          - image: dummy-llm-worker
+            context: worker/dummy
+            file: worker/dummy/Dockerfile
     permissions:
       contents: read
       packages: write
-    outputs:
-      image_tag: ${{ steps.settag.outputs.image_tag }}
     steps:
       - uses: actions/checkout@v4.2.1
 
-      - name: Derive image tag
-        id: settag
-        run: echo "image_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
-      - name: Derive lowercase owner
-        id: setowner
-        run: echo "owner_lc=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - name: Derive tags
+        id: vars
+        run: |
+          echo "image_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "owner_lc=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "repo_lc=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -42,11 +43,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push ${{ matrix.image }}
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: Dockerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
           push: true
           tags: |
-            ghcr.io/${{ steps.setowner.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:${{ steps.settag.outputs.image_tag }}
+            ghcr.io/${{ steps.vars.outputs.owner_lc }}/${{ steps.vars.outputs.repo_lc }}/${{ matrix.image }}:${{ steps.vars.outputs.image_tag }}
+            ghcr.io/${{ steps.vars.outputs.owner_lc }}/${{ steps.vars.outputs.repo_lc }}/${{ matrix.image }}:latest
